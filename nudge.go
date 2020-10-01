@@ -11,10 +11,13 @@ import (
 	"github.com/tarosky/gutenberg-notifier/notify"
 	"github.com/urfave/cli/v2"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func createLogger() *zap.Logger {
-	log, err := zap.NewDevelopment(zap.WithCaller(false))
+	cfg := zap.NewDevelopmentConfig()
+	cfg.EncoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout("2006-01-02T15:04:05.000000Z0700")
+	log, err := cfg.Build(zap.WithCaller(false))
 	if err != nil {
 		panic("failed to initialize logger")
 	}
