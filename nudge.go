@@ -31,8 +31,8 @@ var (
 
 func main() {
 	app := cli.NewApp()
-	app.Name = "notifier"
-	app.Usage = "notify NFS file changes"
+	app.Name = "nudge"
+	app.Description = "Notify file changes"
 
 	app.Flags = []cli.Flag{
 		&cli.StringSliceFlag{
@@ -65,6 +65,18 @@ func main() {
 			Value:   &cli.StringSlice{},
 			Usage:   "Full path to the mount point where the file is located. Never include trailing slash.",
 		},
+		&cli.IntFlag{
+			Name:    "max-mnt-depth",
+			Aliases: []string{"md"},
+			Value:   16,
+			Usage:   "Maximum depth to scan for getting absolute mount point path. Increasing this value too much could cause compilation failure.",
+		},
+		&cli.IntFlag{
+			Name:    "max-dir-depth",
+			Aliases: []string{"dd"},
+			Value:   32,
+			Usage:   "Maximum depth to scan for getting absolute file path. Increasing this value too much could cause compilation failure.",
+		},
 		&cli.PathFlag{
 			Name:     "nudge-file",
 			Aliases:  []string{"f"},
@@ -94,6 +106,8 @@ func main() {
 			InclFullNames: c.StringSlice("incl-fullname"),
 			InclExts:      c.StringSlice("incl-ext"),
 			InclMntPaths:  c.StringSlice("incl-mntpath"),
+			MaxMntDepth:   c.Int("max-mnt-depth"),
+			MaxDirDepth:   c.Int("max-dir-depth"),
 			BpfDebug:      0,
 			Log:           log,
 		}
