@@ -3,7 +3,7 @@ module github.com/tarosky/gutenberg-nudge
 go 1.15
 
 require (
-	github.com/tarosky/gutenberg-notifier v0.0.0-20200928041435-965a31c0acd6
+	github.com/tarosky/gutenberg-notifier v0.0.0-20201007222550-7e0104cf0f75
 	github.com/urfave/cli/v2 v2.2.0
 	go.uber.org/zap v1.16.0
 )
