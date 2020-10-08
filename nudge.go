@@ -109,6 +109,7 @@ func main() {
 			MaxMntDepth:   c.Int("max-mnt-depth"),
 			MaxDirDepth:   c.Int("max-dir-depth"),
 			BpfDebug:      0,
+			Quit:          false,
 			Log:           log,
 		}
 
