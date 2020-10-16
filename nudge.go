@@ -203,6 +203,15 @@ type nudger struct {
 }
 
 func newNudger(nudgeFile string) *nudger {
+	if _, err := os.Stat(nudgeFile); err != nil {
+		f, err := os.Create(nudgeFile)
+		if err != nil {
+			log.Fatal("unable to create nudge file", zap.Error(err))
+		}
+		log.Info("no nudge file found. created.", zap.String("path", nudgeFile))
+		f.Close()
+	}
+
 	return &nudger{path: nudgeFile, first: true}
 }
 
