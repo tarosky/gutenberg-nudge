@@ -115,11 +115,11 @@ func main() {
 		}
 
 		if err := cfg.SetModesFromString(c.StringSlice("incl-fmode")); err != nil {
-			log.Fatal("illegal incl-fmode parameter", zap.Error(err))
+			log.Panic("illegal incl-fmode parameter", zap.Error(err))
 		}
 
 		if nudgeType := c.String("nudge-type"); nudgeType != "mtime" {
-			log.Fatal("illegal nudge-type parameter", zap.String("parameter", nudgeType))
+			log.Panic("illegal nudge-type parameter", zap.String("parameter", nudgeType))
 		}
 
 		ng := newNudger(c.Path("nudge-file"))
@@ -148,7 +148,7 @@ func main() {
 
 	err := app.Run(os.Args)
 	if err != nil {
-		stdlog.Fatal("failed to run app", zap.Error(err))
+		stdlog.Panic("failed to run app", zap.Error(err))
 	}
 }
 
@@ -212,7 +212,7 @@ func newNudger(nudgeFile string) *nudger {
 	if _, err := os.Stat(nudgeFile); err != nil {
 		f, err := os.Create(nudgeFile)
 		if err != nil {
-			log.Fatal("unable to create nudge file", zap.Error(err))
+			log.Panic("unable to create nudge file", zap.Error(err))
 		}
 		log.Info("no nudge file found. created.", zap.String("path", nudgeFile))
 		f.Close()
