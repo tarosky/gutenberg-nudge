@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	stdlog "log"
@@ -18,6 +19,7 @@ import (
 	"github.com/urfave/cli/v2"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -153,65 +155,188 @@ func setPIDFile(path string) func() {
 	}
 }
 
+type FileWatch struct {
+	IncludedFullNames  []string `json:"included-full-names"`
+	IncludedExtensions []string `json:"included-extensions"`
+	IncludedMountPaths []string `json:"included-mount-paths"`
+	MaxDirDepth        int      `json:"max-directory-depth"`
+	MaxMountDepth      int      `json:"max-mount-depth"`
+	NotificationFile   string   `json:"notification-file"`
+}
+
+type WatchedDir struct {
+	PathFromMountPoint           string `json:"path-from-mount-point"`
+	NotificationFile             string `json:"notification-file"`
+	NotificationWithAdditionFile string `json:"notification-with-addition-file"`
+}
+
+func (d *WatchedDir) normalizedPathFromMountPoint() string {
+	return strings.Trim(d.PathFromMountPoint, "/") + "/"
+}
+
+type DirsWatch struct {
+	IncludedDirs                     []WatchedDir `json:"included-directories"`
+	MountPath                        string       `json:"mount-path"`
+	AdditionalNotificationExtensions []string     `json:"additional-notification-extensions"`
+	MaxDirDepth                      int          `json:"max-directory-depth"`
+	MaxMountDepth                    int          `json:"max-mount-depth"`
+}
+
+func (w *DirsWatch) includedDirPaths() []string {
+	ds := make([]string, 0, len(w.IncludedDirs))
+	for _, d := range w.IncludedDirs {
+		ds = append(ds, d.normalizedPathFromMountPoint())
+	}
+
+	return ds
+}
+
+type Watches struct {
+	File FileWatch `json:"file"`
+	Dirs DirsWatch `json:"directories"`
+}
+
+type config struct {
+	Watches Watches `json:"watches"`
+}
+
+func loadConfig(log *zap.Logger, path string) *config {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Panic("failed to open config file", zap.Error(err))
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			log.Error("failed to close config file", zap.Error(err))
+		}
+	}()
+
+	data, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Error("failed to read config file", zap.Error(err))
+	}
+
+	cfg := &config{}
+	if err := json.Unmarshal(data, cfg); err != nil {
+		log.Panic("Illegal config file", zap.Error(err))
+	}
+
+	if cfg.Watches.File.IncludedFullNames == nil {
+		cfg.Watches.File.IncludedFullNames = []string{}
+	}
+
+	if cfg.Watches.File.IncludedExtensions == nil {
+		cfg.Watches.File.IncludedExtensions = []string{}
+	}
+
+	if cfg.Watches.File.IncludedMountPaths == nil {
+		cfg.Watches.File.IncludedMountPaths = []string{}
+	}
+
+	if cfg.Watches.Dirs.IncludedDirs == nil {
+		cfg.Watches.Dirs.IncludedDirs = []WatchedDir{}
+	}
+
+	if cfg.Watches.Dirs.AdditionalNotificationExtensions == nil {
+		cfg.Watches.Dirs.AdditionalNotificationExtensions = []string{}
+	}
+
+	return cfg
+}
+
+func dirsWithTrailingSlash(dirs []string) []string {
+	ds := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		ds = append(ds, strings.TrimRight(d, "/")+"/")
+	}
+	return ds
+}
+
+type pathNudgers struct {
+	nudger   *nudgerWithAddition
+	interval int
+	eventCh  chan *notify.Event
+}
+
+type dirsNudgers map[string]*pathNudgers
+
+func newDirsNudgersFromConfig(c *config, interval int) dirsNudgers {
+	ns := dirsNudgers{}
+	for _, d := range c.Watches.Dirs.IncludedDirs {
+		ns[d.normalizedPathFromMountPoint()] = &pathNudgers{
+			nudger:   newNudgerWithAddition(d.NotificationFile, d.NotificationWithAdditionFile),
+			interval: interval,
+			eventCh:  make(chan *notify.Event),
+		}
+	}
+	return ns
+}
+
+func (n *pathNudgers) pathListenAndNudge(additionalNotifExts []string) {
+	go func() {
+		pace := time.Duration(n.interval) * time.Millisecond
+		pacemaker := time.NewTicker(pace)
+		pacemakerHasBaton := false
+		addition := false
+
+		for {
+			select {
+			case t := <-pacemaker.C:
+				if pacemakerHasBaton {
+					if err := n.nudger.nudge(&t, addition); err != nil {
+						log.Error("failed to nudge", zap.Error(err))
+					} else {
+						log.Debug("nudged", zap.Time("mtime", t), zap.Bool("addition", addition))
+					}
+					pacemakerHasBaton = false
+					addition = false
+					continue
+				}
+
+				// Do nothing
+			case ev, ok := <-n.eventCh:
+				if !ok {
+					return
+				}
+
+				for _, ext := range additionalNotifExts {
+					if filepath.Ext(ev.Name) == ext {
+						addition = true
+					}
+				}
+				if ev.Name == "" {
+					addition = true
+				}
+
+				if pacemakerHasBaton {
+					continue
+				}
+
+				t := time.Now()
+				if n.nudger.last == nil || (*n.nudger.last).Add(pace).Before(t) {
+					n.nudger.nudge(&t, addition)
+					log.Debug("nudged", zap.Time("mtime", t))
+					pacemaker.Reset(pace)
+					addition = false
+					continue
+				}
+
+				pacemakerHasBaton = true
+			}
+		}
+	}()
+}
+
 func main() {
 	app := cli.NewApp()
 	app.Name = "nudge"
 	app.Description = "Notify file changes"
 
 	app.Flags = []cli.Flag{
-		&cli.StringSliceFlag{
-			Name:    "excl-comm",
-			Aliases: []string{"ec"},
-			Value:   &cli.StringSlice{},
-			Usage:   "Command name to be excluded",
-		},
-		&cli.StringSliceFlag{
-			Name:    "incl-fmode",
-			Aliases: []string{"im"},
-			Value:   &cli.StringSlice{},
-			Usage:   "File operation mode to be included. Possible values are: " + strings.Join(notify.AllFModes(), ", ") + ".",
-		},
-		&cli.StringSliceFlag{
-			Name:    "incl-fullname",
-			Aliases: []string{"in"},
-			Value:   &cli.StringSlice{},
-			Usage:   "Full file name to be included.",
-		},
-		&cli.StringSliceFlag{
-			Name:    "incl-ext",
-			Aliases: []string{"ie"},
-			Value:   &cli.StringSlice{},
-			Usage:   "File with specified extension to be included. Include leading dot.",
-		},
-		&cli.StringSliceFlag{
-			Name:    "incl-mntpath",
-			Aliases: []string{"ir"},
-			Value:   &cli.StringSlice{},
-			Usage:   "Full path to the mount point where the file is located. Never include trailing slash.",
-		},
-		&cli.IntFlag{
-			Name:    "max-mnt-depth",
-			Aliases: []string{"md"},
-			Value:   16,
-			Usage:   "Maximum depth to scan for getting absolute mount point path. Increasing this value too much could cause compilation failure.",
-		},
-		&cli.IntFlag{
-			Name:    "max-dir-depth",
-			Aliases: []string{"dd"},
-			Value:   32,
-			Usage:   "Maximum depth to scan for getting absolute file path. Increasing this value too much could cause compilation failure.",
-		},
 		&cli.PathFlag{
-			Name:     "nudge-file",
-			Aliases:  []string{"f"},
-			Required: true,
-			Usage:    "File to nudge when change happens.",
-		},
-		&cli.StringFlag{
-			Name:    "nudge-type",
-			Aliases: []string{"t"},
-			Value:   "mtime",
-			Usage:   "The way gutenberg-nudge nudges using the file. Currently the only supported value is mtime.",
+			Name:    "config-file",
+			Aliases: []string{"c"},
+			Usage:   "Path to configuration file.",
 		},
 		&cli.IntFlag{
 			Name:    "nudge-interval",
@@ -251,33 +376,43 @@ func main() {
 			mustGetAbsPath("error-log-path"))
 		defer log.Sync()
 
-		cfg := &notify.Config{
-			ExclComms:     c.StringSlice("excl-comm"),
-			InclFullNames: c.StringSlice("incl-fullname"),
-			InclExts:      c.StringSlice("incl-ext"),
-			InclMntPaths:  c.StringSlice("incl-mntpath"),
-			MaxMntDepth:   c.Int("max-mnt-depth"),
-			MaxDirDepth:   c.Int("max-dir-depth"),
-			BpfDebug:      0,
-			Quit:          false,
-			Log:           log,
+		cfg := loadConfig(log, mustGetAbsPath("config-file"))
+
+		fileNotifConfig := &notify.Config{
+			ExclComms:        []string{},
+			InclFModes:       notify.FModeWrite,
+			InclPathPrefixes: []string{},
+			InclFullNames:    cfg.Watches.File.IncludedFullNames,
+			InclExts:         cfg.Watches.File.IncludedExtensions,
+			InclMntPaths:     cfg.Watches.File.IncludedMountPaths,
+			MaxMntDepth:      cfg.Watches.File.MaxMountDepth,
+			MaxDirDepth:      cfg.Watches.File.MaxDirDepth,
+			BpfDebug:         0,
+			Quit:             false,
+			Log:              log,
 		}
 
-		if err := cfg.SetModesFromString(c.StringSlice("incl-fmode")); err != nil {
-			log.Panic("illegal incl-fmode parameter", zap.Error(err))
+		dirNotifConfig := &notify.Config{
+			ExclComms:        []string{},
+			InclFModes:       notify.FModeWrite,
+			InclPathPrefixes: cfg.Watches.Dirs.includedDirPaths(),
+			InclFullNames:    []string{},
+			InclExts:         []string{},
+			InclMntPaths:     []string{cfg.Watches.Dirs.MountPath},
+			MaxMntDepth:      cfg.Watches.Dirs.MaxMountDepth,
+			MaxDirDepth:      cfg.Watches.Dirs.MaxDirDepth,
+			BpfDebug:         0,
+			Quit:             false,
+			Log:              log,
 		}
 
-		if nudgeType := c.String("nudge-type"); nudgeType != "mtime" {
-			log.Panic("illegal nudge-type parameter", zap.String("parameter", nudgeType))
-		}
-
-		ng := newNudger(c.Path("nudge-file"))
 		nudgeInterval := c.Int("nudge-interval")
 
 		removePIDFile := setPIDFile(mustGetAbsPath("pid-file"))
 		defer removePIDFile()
 
-		eventCh := make(chan *notify.Event)
+		fileEventCh := make(chan *notify.Event)
+		dirsEventCh := make(chan *notify.Event)
 		ctx, cancel := context.WithCancel(context.Background())
 
 		sig := make(chan os.Signal)
@@ -292,8 +427,31 @@ func main() {
 			cancel()
 		}()
 
-		listenAndNudge(ng, nudgeInterval, eventCh)
-		notify.Run(ctx, cfg, eventCh)
+		fileNudger := newNudger(cfg.Watches.File.NotificationFile)
+		fileListenAndNudge(fileNudger, nudgeInterval, fileEventCh)
+
+		dirsNudgers := newDirsNudgersFromConfig(cfg, nudgeInterval)
+		dirsListenAndNudge(
+			dirsNudgers,
+			cfg.Watches.Dirs.AdditionalNotificationExtensions,
+			nudgeInterval,
+			dirsEventCh)
+
+		eg := &errgroup.Group{}
+
+		eg.Go(func() error {
+			notify.Run(ctx, fileNotifConfig, fileEventCh)
+			return nil
+		})
+
+		eg.Go(func() error {
+			notify.Run(ctx, dirNotifConfig, dirsEventCh)
+			return nil
+		})
+
+		if err := eg.Wait(); err != nil {
+			panic("should not happen")
+		}
 
 		return nil
 	}
@@ -304,11 +462,12 @@ func main() {
 	}
 }
 
-func listenAndNudge(nudger *nudger, interval int, eventCh <-chan *notify.Event) {
+func fileListenAndNudge(nudger *nudger, interval int, fileEventCh <-chan *notify.Event) {
 	go func() {
 		pace := time.Duration(interval) * time.Millisecond
 		pacemaker := time.NewTicker(pace)
 		pacemakerHasBaton := false
+
 		for {
 			select {
 			case t := <-pacemaker.C:
@@ -323,9 +482,8 @@ func listenAndNudge(nudger *nudger, interval int, eventCh <-chan *notify.Event) 
 				}
 
 				// Do nothing
-			case _, ok := <-eventCh:
+			case _, ok := <-fileEventCh:
 				if !ok {
-					pacemaker.Stop()
 					return
 				}
 
@@ -334,14 +492,7 @@ func listenAndNudge(nudger *nudger, interval int, eventCh <-chan *notify.Event) 
 				}
 
 				t := time.Now()
-				if nudger.last == nil {
-					nudger.nudge(&t)
-					log.Debug("nudged", zap.Time("mtime", t))
-					pacemaker.Reset(pace)
-					continue
-				}
-
-				if (*nudger.last).Add(pace).Before(t) {
+				if nudger.last == nil || (*nudger.last).Add(pace).Before(t) {
 					nudger.nudge(&t)
 					log.Debug("nudged", zap.Time("mtime", t))
 					pacemaker.Reset(pace)
@@ -354,10 +505,41 @@ func listenAndNudge(nudger *nudger, interval int, eventCh <-chan *notify.Event) 
 	}()
 }
 
+func dirsListenAndNudge(
+	nudgers dirsNudgers,
+	additionalNotifExts []string,
+	interval int,
+	dirsEventCh <-chan *notify.Event,
+) {
+	for _, n := range nudgers {
+		n.pathListenAndNudge(additionalNotifExts)
+	}
+
+	go func() {
+		for ev := range dirsEventCh {
+			if ev.PathFromMount == "" {
+				for _, n := range nudgers {
+					n.eventCh <- ev
+				}
+				continue
+			}
+
+			for p, n := range nudgers {
+				if strings.HasPrefix(ev.PathFromMount, p) {
+					n.eventCh <- ev
+				}
+			}
+		}
+
+		for _, n := range nudgers {
+			close(n.eventCh)
+		}
+	}()
+}
+
 type nudger struct {
-	path  string
-	first bool
-	last  *time.Time
+	path string
+	last *time.Time
 }
 
 func newNudger(nudgeFile string) *nudger {
@@ -370,24 +552,58 @@ func newNudger(nudgeFile string) *nudger {
 		f.Close()
 	}
 
-	return &nudger{path: nudgeFile, first: true}
+	return &nudger{path: nudgeFile}
 }
 
 func (n *nudger) nudge(t *time.Time) error {
-	if n.first {
-		n.first = false
-		if _, err := os.Stat(n.path); err != nil {
-			f, err := os.Create(n.path)
-			if err != nil {
-				return err
-			}
-			f.Close()
-			n.last = t
-			return nil
-		}
+	if err := os.Chtimes(n.path, *t, *t); err != nil {
+		return err
 	}
 
-	if err := os.Chtimes(n.path, *t, *t); err != nil {
+	n.last = t
+	return nil
+}
+
+type nudgerWithAddition struct {
+	path             string
+	pathWithAddition string
+	last             *time.Time
+}
+
+func newNudgerWithAddition(nudgeFile, nudgerFileWithAddition string) *nudgerWithAddition {
+	if _, err := os.Stat(nudgeFile); err != nil {
+		f, err := os.Create(nudgeFile)
+		if err != nil {
+			log.Panic("unable to create nudge file", zap.Error(err))
+		}
+		log.Info("no nudge file found. created.", zap.String("path", nudgeFile))
+		f.Close()
+	}
+
+	if _, err := os.Stat(nudgerFileWithAddition); err != nil {
+		f, err := os.Create(nudgerFileWithAddition)
+		if err != nil {
+			log.Panic("unable to create nudgeWithAddition file", zap.Error(err))
+		}
+		log.Info("no nudgeWithAddition file found. created.", zap.String("path", nudgerFileWithAddition))
+		f.Close()
+	}
+
+	return &nudgerWithAddition{
+		path:             nudgeFile,
+		pathWithAddition: nudgerFileWithAddition,
+	}
+}
+
+func (n *nudgerWithAddition) nudge(t *time.Time, addition bool) error {
+	var path string
+	if addition {
+		path = n.pathWithAddition
+	} else {
+		path = n.path
+	}
+
+	if err := os.Chtimes(path, *t, *t); err != nil {
 		return err
 	}
 
